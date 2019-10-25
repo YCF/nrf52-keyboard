@@ -21,12 +21,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "app_timer.h"
 #include "ble.h"
 #include "ble_advdata.h"
-#include "ble_advertising.h"
 #include "ble_conn_params.h"
 #include "ble_conn_state.h"
 #include "ble_dfu.h"
 #include "ble_dis.h"
 #include "ble_srv_common.h"
+#include "eeconfig.h"
 #include "nrf_ble_gatt.h"
 #include "nrf_ble_qwr.h"
 #include "nrf_bootloader_info.h"
@@ -36,7 +36,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "nrf_sdh_ble.h"
 #include "nrf_sdh_soc.h"
 #include "peer_manager_handler.h"
-#include "eeconfig.h"
 
 #include "ble_config.h"
 
@@ -104,7 +103,7 @@ static void identities_set(pm_peer_id_list_skip_t skip)
     APP_ERROR_CHECK(err_code);
 }
 
-void ble_disconnect()
+static void ble_disconnect()
 {
     sd_ble_gap_adv_stop(m_advertising.adv_handle);
     if (m_conn_handle != BLE_CONN_HANDLE_INVALID) {
@@ -132,35 +131,124 @@ NRF_SDH_STATE_OBSERVER(m_buttonless_dfu_state_obs, 0) = {
     .handler = buttonless_dfu_sdh_state_observer,
 };
 
+#ifdef MACADDR_SEPRATOR
+/**@brief MAC地址转换为设备名后缀.
+ *
+ * 读取MAC地址，并将其转换后放置到设备名最后
+ */
+static void get_device_name(char* device_name, int offset)
+{
+    const char lookup_table[] = { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F' };
+
+    strcpy(device_name, DEVICE_NAME);
+    device_name[offset++] = MACADDR_SEPRATOR;
+
+    ble_gap_addr_t ble_addr;
+    sd_ble_gap_addr_get(&ble_addr);
+
+    for (uint8_t i = 0; i < 3; i++) {
+        uint8_t addr = ble_addr.addr[3 + i];
+        device_name[offset++] = lookup_table[addr / 16];
+        device_name[offset++] = lookup_table[addr % 16];
+    }
+    device_name[offset] = 0x00;
+}
+#endif
+
+static void set_device_name(void) {
+    ret_code_t err_code;
+    ble_gap_conn_sec_mode_t sec_mode;
+
+    BLE_GAP_CONN_SEC_MODE_SET_OPEN(&sec_mode);
+
+#ifdef MACADDR_SEPRATOR
+    int orig_len = strlen(DEVICE_NAME);
+    int name_len = orig_len + 8;
+    char device_name[name_len];
+    get_device_name(device_name, orig_len);
+
+    err_code = sd_ble_gap_device_name_set(&sec_mode, (const uint8_t*)device_name, strlen(device_name));
+#else
+    err_code = sd_ble_gap_device_name_set(&sec_mode, (const uint8_t*)DEVICE_NAME, strlen(DEVICE_NAME));
+#endif
+    APP_ERROR_CHECK(err_code);
+}
+/**@brief 清空所有绑定数据.
+ */
+void delete_bonds(void)
+{
+    ret_code_t err_code;
+
+    ble_disconnect();
+
+    err_code = pm_peers_delete();
+    APP_ERROR_CHECK(err_code);
+
+    //清空所有绑定后，自动回到首个设备
+    switch_id = 0;
+    eeconfig_write_switch_id(switch_id);
+    switch_device_select(switch_id);
+}
+
+/**@brief 删除当前设备绑定数据.
+ *
+ * 查找并删除与当前gap addr绑定的绑定数据
+ */
+static void peer_list_find_and_delete_bond(void)
+{
+    pm_peer_id_t peer_id;
+
+    peer_id = pm_next_peer_id_get(PM_PEER_ID_INVALID);
+
+    while (peer_id != PM_PEER_ID_INVALID) {
+        uint16_t length = 8;
+        uint8_t addr[8];
+
+        if (pm_peer_data_app_data_load(peer_id, addr, &length) == NRF_SUCCESS) {
+            if (addr[3] == switch_id) {
+                pm_peer_delete(peer_id);
+            }
+        }
+
+        peer_id = pm_next_peer_id_get(peer_id);
+    }
+}
+
 /**@brief 切换连接设备.
  *
  * @param[in] id  要切换的设备的ID号
  */
-void switch_device_id(uint8_t id)
+void switch_device_select(uint8_t id)
 {
     ret_code_t ret;
     ble_gap_addr_t gap_addr;
     if (id == switch_id) {
         return; //如果重复切换，则直接退出，不做任何操作
+    } else {
+        ble_disconnect();
     }
     switch_id = id;
 
     eeconfig_write_switch_id(id);
 
-    ret = pm_id_addr_get(&gap_addr);
+    ret = sd_ble_gap_addr_get(&gap_addr);
     APP_ERROR_CHECK(ret);
 
-    gap_addr.addr[3] = id; // switch status 1, 2, or 3
+    gap_addr.addr[3] = id;
 
-    ret = pm_id_addr_set(&gap_addr);
+    ret = sd_ble_gap_addr_set(&gap_addr);
     APP_ERROR_CHECK(ret);
-
-    if (m_conn_handle == BLE_CONN_HANDLE_INVALID) {
-        sd_ble_gap_adv_stop(m_advertising.adv_handle);
-        ble_advertising_start(&m_advertising, BLE_ADV_MODE_FAST);
-    } else {
-        sd_ble_gap_disconnect(m_conn_handle, BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
-    }
+}
+/**@brief 重新绑定当前设备.
+ *
+ * @param[in] id  要绑定设备的ID号
+ */
+void switch_device_reset()
+{
+    peer_list_find_and_delete_bond();
+    uint8_t reset_id = switch_id;
+    switch_id = 10; //将switch_id设置为无效ID
+    switch_device_select(reset_id);
 }
 /**@brief 切换连接设备初始化.
  *
@@ -173,40 +261,40 @@ static void switch_device_init()
     ble_gap_addr_t gap_addr;
     switch_id = eeconfig_read_switch_id();
 
-    ret = pm_id_addr_get(&gap_addr);
+    ret = sd_ble_gap_addr_get(&gap_addr);
     APP_ERROR_CHECK(ret);
 
     gap_addr.addr[3] = switch_id;
 
-    ret = pm_id_addr_set(&gap_addr);
+    ret = sd_ble_gap_addr_set(&gap_addr);
     APP_ERROR_CHECK(ret);
 }
-
-/**@brief Clear bond information from persistent storage.
+/**@brief 更新切换设备数据.
+ *
+ * 获取当前gap addr并更新PM数据
  */
-void delete_bonds(void)
+static void switch_device_update(pm_peer_id_t peer_id)
 {
-    ret_code_t err_code;
+    uint32_t err_code;
+    ble_gap_addr_t gap_addr;
+    uint16_t length = 8;
+    uint8_t addr[8];
 
-    ble_disconnect();
-
-    err_code = pm_peers_delete();
+    err_code = pm_id_addr_get(&gap_addr);
     APP_ERROR_CHECK(err_code);
 
-    switch_device_id(0); //清空所有绑定时，自动回到首个设备
-}
+    for (uint8_t i = 0; i < BLE_GAP_ADDR_LEN; i++)
+        addr[i] = gap_addr.addr[i];
 
-void delete_bond_id(uint8_t id)
-{
-    ret_code_t err_code;
+    addr[3] =switch_id;
 
-    ble_disconnect();
-
-    err_code = pm_peer_delete(id);
+    err_code = pm_peer_data_app_data_store(m_peer_id, addr, length, NULL);
     APP_ERROR_CHECK(err_code);
 }
 
-/**@brief Function for starting advertising.
+/**@brief 开启蓝牙广播.
+ * 
+ * @param[in] erase_bonds  是否清空所有绑定数据
  */
 void advertising_start(bool erase_bonds)
 {
@@ -215,9 +303,27 @@ void advertising_start(bool erase_bonds)
         // Advertising is started by PM_EVT_PEERS_DELETE_SUCCEEDED event.
     } else {
         whitelist_set(PM_PEER_ID_LIST_SKIP_NO_ID_ADDR);
-
+        switch_device_init();
         ret_code_t ret = ble_advertising_start(&m_advertising, BLE_ADV_MODE_FAST);
         APP_ERROR_CHECK(ret);
+    }
+}
+/**@brief 重新开启蓝牙广播.
+ * 
+ * @param[in] mode  广播模式
+ * @param[in] reset  是否重新绑定
+ */
+void advertising_restart(ble_adv_mode_t mode, bool reset)
+{
+    if (m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+        sd_ble_gap_adv_stop(m_advertising.adv_handle);
+        ble_advertising_start(&m_advertising, mode);
+    } else {
+        sd_ble_gap_disconnect(m_conn_handle, BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
+    }
+
+    if (reset) {
+        ble_advertising_restart_without_whitelist(&m_advertising);
     }
 }
 
@@ -249,6 +355,7 @@ static void advertising_config_get(ble_adv_modes_config_t* p_config)
     p_config->ble_adv_slow_enabled = true;
     p_config->ble_adv_slow_interval = APP_ADV_SLOW_INTERVAL;
     p_config->ble_adv_slow_timeout = APP_ADV_SLOW_DURATION;
+    p_config->ble_adv_on_disconnect_disabled = false;
 }
 
 /**@brief Function for handling dfu events from the Buttonless Secure DFU service
@@ -306,6 +413,7 @@ static void pm_evt_handler(pm_evt_t const* p_evt)
     switch (p_evt->evt_id) {
     case PM_EVT_CONN_SEC_SUCCEEDED:
         m_peer_id = p_evt->peer_id;
+        switch_device_update(m_peer_id);
         event_handler(USER_BLE_CONNECTED);
         break;
     case PM_EVT_BONDED_PEER_CONNECTED:
@@ -324,45 +432,21 @@ static void pm_evt_handler(pm_evt_t const* p_evt)
         }
         break;
 
+    case PM_EVT_CONN_SEC_CONFIG_REQ:
+        {
+        // allow pairing request from an already bonded peer.
+        pm_conn_sec_config_t conn_sec_config = { .allow_repairing = true };
+        pm_conn_sec_config_reply(p_evt->conn_handle, &conn_sec_config);
+
+        break;
+        }
+
     default:
         break;
     }
 }
 
-void restart_advertising_no_whitelist()
-{
-    ret_code_t err_code;
-    if (m_conn_handle == BLE_CONN_HANDLE_INVALID) {
-        err_code = ble_advertising_restart_without_whitelist(&m_advertising);
-        if (err_code != NRF_ERROR_INVALID_STATE) {
-            APP_ERROR_CHECK(err_code);
-        }
-    }
-}
 
-#ifdef MACADDR_SEPRATOR
-/**@brief MAC地址转换为设备名后缀.
- *
- * 读取MAC地址，并将其转换后放置到设备名最后
- */
-static void get_device_name(char* device_name, int offset)
-{
-    const char lookup_table[] = { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F' };
-
-    strcpy(device_name, DEVICE_NAME);
-    device_name[offset++] = MACADDR_SEPRATOR;
-
-    ble_gap_addr_t ble_addr;
-    sd_ble_gap_addr_get(&ble_addr);
-
-    for (uint8_t i = 0; i < 3; i++) {
-        uint8_t addr = ble_addr.addr[3 + i];
-        device_name[offset++] = lookup_table[addr / 16];
-        device_name[offset++] = lookup_table[addr % 16];
-    }
-    device_name[offset] = 0x00;
-}
-#endif
 
 /**@brief Function for the GAP initialization.
  *
@@ -373,23 +457,8 @@ static void gap_params_init(void)
 {
     ret_code_t err_code;
     ble_gap_conn_params_t gap_conn_params;
-    ble_gap_conn_sec_mode_t sec_mode;
 
-    BLE_GAP_CONN_SEC_MODE_SET_OPEN(&sec_mode);
-#ifdef MACADDR_SEPRATOR
-    int orig_len = strlen(DEVICE_NAME);
-    int name_len = orig_len + 8;
-    char device_name[name_len];
-    get_device_name(device_name, orig_len);
-
-    err_code = sd_ble_gap_device_name_set(&sec_mode,
-        (const uint8_t*)device_name,
-        strlen(device_name));
-#else
-    err_code = sd_ble_gap_device_name_set(&sec_mode, (const uint8_t*)DEVICE_NAME, strlen(DEVICE_NAME));
-#endif
-
-    APP_ERROR_CHECK(err_code);
+    set_device_name();
 
     err_code = sd_ble_gap_appearance_set(BLE_APPEARANCE_HID_KEYBOARD);
     APP_ERROR_CHECK(err_code);
@@ -794,7 +863,6 @@ void ble_services_init(evt_handler handler)
     peer_manager_init();
     gap_params_init();
     gatt_init();
-    switch_device_init();
     advertising_init();
     // services
     qwr_init();
